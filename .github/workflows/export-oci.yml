@@ -1,0 +1,54 @@
+name: Export OCI to TGZ
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image (e.g. pytorch/pytorch or ollama/ollama)"
+        required: true
+        default: "ollama/ollama"
+      tag:
+        description: "Image tag (e.g. latest or 0.30.10)"
+        required: true
+        default: "latest"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (optional)
+        uses: actions/checkout@v4
+
+      - name: Install ORAS
+        run: |
+          curl -LO https://github.com/oras-project/oras/releases/latest/download/oras_1.2.0_linux_amd64.tar.gz
+          tar -xvf oras_1.2.0_linux_amd64.tar.gz
+          sudo mv oras /usr/local/bin/
+
+      - name: Prepare variables
+        run: |
+          IMAGE=${{ github.event.inputs.image }}
+          TAG=${{ github.event.inputs.tag }}
+
+          SAFE_NAME=$(echo "$IMAGE" | tr '/:' '-')
+          EXPORT_DIR="${SAFE_NAME}-${TAG}"
+
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "EXPORT_DIR=$EXPORT_DIR" >> $GITHUB_ENV
+
+      - name: Pull OCI layout
+        run: |
+          oras cp --to-oci-layout docker.io/${IMAGE}:${TAG} ${EXPORT_DIR}:${TAG}
+
+      - name: Create tgz
+        run: |
+          tar -czf ${EXPORT_DIR}.tgz ${EXPORT_DIR}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.EXPORT_DIR }}
+          path: ${{ env.EXPORT_DIR }}.tgz
+``

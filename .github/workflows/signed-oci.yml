@@ -24,6 +24,9 @@ jobs:
         run: |
           set -e
 
+          sudo apt update
+          sudo apt install -y jq
+
           sudo snap install go --classic || true
           export PATH=$PATH:/snap/bin
 
@@ -44,7 +47,6 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
-          # Fix Docker Hub library images
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -63,20 +65,19 @@ jobs:
           set -e
           mkdir -p scripts
 
-          # --- SIGN SCRIPT ---
+          # ✅ SIGN SCRIPT (no deletion, no regen issues)
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
+
           ref=$1
 
-          notation key delete dev || true
-          rm -rf ~/.config/notation/localkeys/dev*
-          notation cert delete -t ca -s dev -a -y || true
-
+          # Generate key ONLY once in this run
           notation cert generate-test --default dev
+
           notation sign $ref
           EOF
 
-          # --- PROCESS SCRIPT ---
+          # ✅ PROCESS SCRIPT (FULL FIX)
           cat << 'EOF' > scripts/process.sh
           #!/bin/sh -xe
 
@@ -88,25 +89,34 @@ jobs:
           tag="${ref##*:}"
           out="${repo}-${tag}"
 
-          # Start local registry
+          # Start registry
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ Copy FULL image (preserves everything)
+          # ✅ Copy full image
           oras copy $ref \
             --to-plain-http localhost:5001/${repo}:${tag}
 
-          # ✅ Sign image
+          # ✅ Sign
           $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
 
-          # ✅ Export FULL graph INCLUDING signatures (CRITICAL FIX)
+          # ✅ ✅ CRITICAL: Extract REAL signer cert (leaf, not CA)
+          notation inspect localhost:5001/${repo}:${tag} -o json > inspect.json
+
+          cat inspect.json \
+            | jq -r '.signatures[0].certificateChain[0]' \
+            | base64 -d > signer.crt
+
+          echo "✅ Extracted signer cert:"
+          openssl x509 -in signer.crt -noout -subject -issuer
+
+          # ✅ Export OCI with signatures
           oras copy -r \
             localhost:5001/${repo}:${tag} \
             --to-oci-layout ${out}
 
           tar -czf ${out}.tgz ${out}
 
-          # Cleanup
           docker rm -f reg || true
           EOF
 
@@ -125,8 +135,10 @@ jobs:
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
+
           mv *.tgz artifacts/ || true
-          cp -r ~/.config/notation artifacts/certs || true
+          mv signer.crt artifacts/ || true
+          cp inspect.json artifacts/ || true
 
       # ✅ Upload
       - name: Upload artifact

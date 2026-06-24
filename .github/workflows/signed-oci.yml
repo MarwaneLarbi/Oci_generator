@@ -1,5 +1,4 @@
 name: Export OCI to TGZ (Signed)
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,7 +14,6 @@ on:
 jobs:
   export:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -23,101 +21,120 @@ jobs:
       - name: Install tools
         run: |
           set -e
-
           sudo apt update
           sudo apt install -y jq openssl
-
           sudo snap install go --classic || true
           export PATH=$PATH:/snap/bin
-
           go install oras.land/oras/cmd/oras@latest
           go install github.com/notaryproject/notation/cmd/notation@latest
-
           sudo mv $(go env GOPATH)/bin/oras /usr/local/bin/
           sudo mv $(go env GOPATH)/bin/notation /usr/local/bin/
+          oras version
+          notation version
 
       # ✅ Prepare variables
       - name: Prepare variables
         run: |
+          set -e
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
-
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
-
           REPO="${IMAGE##*/}"
-
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-          echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "REPO=$REPO" >> $GITHUB_ENV
+          echo "TAG=$TAG"     >> $GITHUB_ENV
+          echo "REPO=$REPO"   >> $GITHUB_ENV
 
       # ✅ Main process
       - name: Process image
         run: |
           set -e
-
           REF="docker.io/${IMAGE}:${TAG}"
           LOCAL="localhost:5001/${REPO}:${TAG}"
           OUT="${REPO}-${TAG}"
 
-          # Start registry
+          # ── Start local registry ──────────────────────────────────────
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # Copy full image (multi-arch OK)
-          oras copy $REF --to-plain-http $LOCAL
+          # ── Pull image into local registry ───────────────────────────
+          oras copy --plain-http $REF $LOCAL 2>/dev/null || \
+          oras copy            $REF $LOCAL
 
-          # ✅ Generate cert + sign
+          # ── Generate test cert and sign ──────────────────────────────
           notation cert generate-test --default dev
 
-          SIGN_OUTPUT=$(notation sign $LOCAL)
+          SIGN_OUTPUT=$(notation sign --plain-http $LOCAL)
           echo "$SIGN_OUTPUT"
 
-          # ✅ Extract digest (CRITICAL FIX)
+          # ── Extract digest from sign output ──────────────────────────
           DIGEST=$(echo "$SIGN_OUTPUT" | grep -o 'sha256:[a-f0-9]\{64\}')
-
           if [ -z "$DIGEST" ]; then
             echo "❌ Failed to extract digest"
             exit 1
           fi
-
           echo "✅ Digest: $DIGEST"
+          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
 
           DIGEST_REF="localhost:5001/${REPO}@${DIGEST}"
 
-          # ✅ Inspect using digest (NOT tag!)
-          notation inspect $DIGEST_REF -o json > inspect.json
-
+          # ── Inspect signature ─────────────────────────────────────────
+          notation inspect --plain-http "$DIGEST_REF" -o json > inspect.json
           echo "=== inspect.json ==="
           cat inspect.json
 
-          # ✅ Extract signer cert (robust + simple)
-          jq -r '.signatures[0].certificateChain[0]' inspect.json > signer.crt
-
-          # ✅ Validate cert
-          if ! openssl x509 -in signer.crt -noout -subject; then
-            echo "❌ Invalid certificate extracted"
+          # ── Get cert from notation local key store ────────────────────
+          CERT_PATH="$HOME/.config/notation/localkeys/dev.crt"
+          if [ ! -f "$CERT_PATH" ]; then
+            echo "❌ dev.crt not found at $CERT_PATH"
+            ls ~/.config/notation/localkeys/ || true
             exit 1
           fi
+          cp "$CERT_PATH" signer.crt
 
+          # ── Validate cert is readable ─────────────────────────────────
+          if ! openssl x509 -in signer.crt -noout -subject; then
+            echo "❌ Invalid certificate"
+            exit 1
+          fi
           echo "✅ Certificate OK"
 
-          # ✅ Export OCI WITH signatures
-          oras copy -r $LOCAL --to-oci-layout $OUT
+          # ── Cross-check fingerprint ───────────────────────────────────
+          EXPECTED_FP=$(jq -r '.Signatures[0].certificates[0].SHA256Fingerprint' inspect.json)
+          ACTUAL_FP=$(openssl x509 -in signer.crt -noout -fingerprint -sha256 \
+                        | sed 's/.*=//;s/://g' | tr 'A-F' 'a-f')
 
-          tar -czf ${OUT}.tgz $OUT
+          echo "Expected fingerprint : $EXPECTED_FP"
+          echo "Actual   fingerprint : $ACTUAL_FP"
 
+          if [ "$EXPECTED_FP" != "$ACTUAL_FP" ]; then
+            echo "❌ Fingerprint mismatch — wrong certificate!"
+            exit 1
+          fi
+          echo "✅ Fingerprint matches — cert is the signer"
+
+          # ── Export OCI layout WITH signatures ─────────────────────────
+          oras copy -r --plain-http $LOCAL --to-oci-layout $OUT
+
+          # ── Pack ──────────────────────────────────────────────────────
+          tar -czf "${OUT}.tgz" "$OUT"
+
+          # ── Cleanup ───────────────────────────────────────────────────
           docker rm -f reg
 
-      # ✅ Save output
+      # ✅ Collect artifacts
       - name: Collect artifacts
         run: |
+          set -e
           mkdir -p artifacts
-          mv *.tgz artifacts/
+          mv *.tgz      artifacts/
           mv signer.crt artifacts/
           mv inspect.json artifacts/
+          # Also save full notation config (trust store + keys)
+          cp -r ~/.config/notation artifacts/notation-config
 
+      # ✅ Upload
       - uses: actions/upload-artifact@v4
         with:
           name: signed-oci-export

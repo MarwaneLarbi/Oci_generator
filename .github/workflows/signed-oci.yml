@@ -44,7 +44,7 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
-          # Fix Docker Hub "library" images
+          # Fix Docker Hub library images
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -57,12 +57,13 @@ jobs:
           echo "REPO=$REPO" >> $GITHUB_ENV
           echo "EXPORT_DIR=$EXPORT_DIR" >> $GITHUB_ENV
 
-      # ✅ Create signing script
+      # ✅ Create scripts
       - name: Create scripts
         run: |
           set -e
           mkdir -p scripts
 
+          # --- SIGN SCRIPT ---
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
           ref=$1
@@ -75,6 +76,7 @@ jobs:
           notation sign $ref
           EOF
 
+          # --- PROCESS SCRIPT ---
           cat << 'EOF' > scripts/process.sh
           #!/bin/sh -xe
 
@@ -82,30 +84,29 @@ jobs:
 
           ref=$1
           repo=$2
+
           tag="${ref##*:}"
           out="${repo}-${tag}"
 
+          # Start local registry
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ FULL COPY (CRITICAL FIX)
-          # This preserves ALL:
-          # - architectures
-          # - annotations
-          # - attestations
-          # - original index
+          # ✅ Copy FULL image (preserves everything)
           oras copy $ref \
             --to-plain-http localhost:5001/${repo}:${tag}
 
-          # ✅ Sign WITHOUT modifying index
+          # ✅ Sign image
           $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
 
-          # ✅ Export OCI layout (same as oras cp)
-          oras cp localhost:5001/${repo}:${tag} \
+          # ✅ Export FULL graph INCLUDING signatures (CRITICAL FIX)
+          oras copy -r \
+            localhost:5001/${repo}:${tag} \
             --to-oci-layout ${out}
 
           tar -czf ${out}.tgz ${out}
 
+          # Cleanup
           docker rm -f reg || true
           EOF
 
@@ -118,8 +119,7 @@ jobs:
 
           ./scripts/process.sh \
             docker.io/${IMAGE}:${TAG} \
-            ${REPO} \
-            ${EXPORT_DIR}
+            ${REPO}
 
       # ✅ Collect artifacts
       - name: Collect artifacts

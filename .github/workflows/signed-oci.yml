@@ -36,14 +36,9 @@ jobs:
           sudo mv $(go env GOPATH)/bin/oras /usr/local/bin/
           sudo mv $(go env GOPATH)/bin/notation /usr/local/bin/
 
-          oras version
-          notation version
-
       # ✅ Prepare variables
       - name: Prepare variables
         run: |
-          set -e
-
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
@@ -52,120 +47,78 @@ jobs:
           fi
 
           REPO="${IMAGE##*/}"
-          EXPORT_DIR="${REPO}-${TAG}"
 
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "REPO=$REPO" >> $GITHUB_ENV
-          echo "EXPORT_DIR=$EXPORT_DIR" >> $GITHUB_ENV
 
-      # ✅ Create scripts
-      - name: Create scripts
-        run: |
-          set -e
-          mkdir -p scripts
-
-          # ✅ SIGN SCRIPT (FINAL FIX)
-          cat << 'EOF' > scripts/signoci.sh
-          #!/bin/sh -xe
-
-          ref=$1
-
-          notation cert generate-test --default dev
-          notation sign $ref
-
-          # Export inspect
-          notation inspect $ref -o json > inspect.json
-
-          echo "=== DEBUG: inspect.json ==="
-          cat inspect.json
-
-          # ✅ Robust certificate extraction (handles all formats)
-          CERT=$(jq -r '
-            if .signatures and (.signatures | length > 0) then
-              if .signatures[0].certificateChain then
-                .signatures[0].certificateChain[0]
-              elif .signatures[0].certificates then
-                .signatures[0].certificates[0]
-              elif .signatures[0].x509Certificate then
-                .signatures[0].x509Certificate
-              else
-                empty
-              end
-            else
-              empty
-            end
-          ' inspect.json)
-
-          # ✅ Fail fast if missing
-          if [ -z "$CERT" ] || [ "$CERT" = "null" ]; then
-            echo "❌ ERROR: No certificate found in inspect.json"
-            exit 1
-          fi
-
-          # Save certificate
-          echo "$CERT" > signer.crt
-
-          echo "✅ Extracted signer certificate:"
-          openssl x509 -in signer.crt -noout -subject -issuer
-          EOF
-
-          # ✅ PROCESS SCRIPT
-          cat << 'EOF' > scripts/process.sh
-          #!/bin/sh -xe
-
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-          ref=$1
-          repo=$2
-
-          tag="${ref##*:}"
-          out="${repo}-${tag}"
-
-          # Start local registry
-          docker run -d -p 5001:5000 --name reg registry:2
-          sleep 3
-
-          # Copy FULL image
-          oras copy $ref \
-            --to-plain-http localhost:5001/${repo}:${tag}
-
-          # Sign + extract certificate
-          $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
-
-          # Export OCI WITH signatures
-          oras copy -r \
-            localhost:5001/${repo}:${tag} \
-            --to-oci-layout ${out}
-
-          tar -czf ${out}.tgz ${out}
-
-          docker rm -f reg || true
-          EOF
-
-          chmod +x scripts/*.sh
-
-      # ✅ Run pipeline
+      # ✅ Main process
       - name: Process image
         run: |
           set -e
 
-          ./scripts/process.sh \
-            docker.io/${IMAGE}:${TAG} \
-            ${REPO}
+          REF="docker.io/${IMAGE}:${TAG}"
+          LOCAL="localhost:5001/${REPO}:${TAG}"
+          OUT="${REPO}-${TAG}"
 
-      # ✅ Collect artifacts
+          # Start registry
+          docker run -d -p 5001:5000 --name reg registry:2
+          sleep 3
+
+          # Copy full image (multi-arch OK)
+          oras copy $REF --to-plain-http $LOCAL
+
+          # ✅ Generate cert + sign
+          notation cert generate-test --default dev
+
+          SIGN_OUTPUT=$(notation sign $LOCAL)
+          echo "$SIGN_OUTPUT"
+
+          # ✅ Extract digest (CRITICAL FIX)
+          DIGEST=$(echo "$SIGN_OUTPUT" | grep -o 'sha256:[a-f0-9]\{64\}')
+
+          if [ -z "$DIGEST" ]; then
+            echo "❌ Failed to extract digest"
+            exit 1
+          fi
+
+          echo "✅ Digest: $DIGEST"
+
+          DIGEST_REF="localhost:5001/${REPO}@${DIGEST}"
+
+          # ✅ Inspect using digest (NOT tag!)
+          notation inspect $DIGEST_REF -o json > inspect.json
+
+          echo "=== inspect.json ==="
+          cat inspect.json
+
+          # ✅ Extract signer cert (robust + simple)
+          jq -r '.signatures[0].certificateChain[0]' inspect.json > signer.crt
+
+          # ✅ Validate cert
+          if ! openssl x509 -in signer.crt -noout -subject; then
+            echo "❌ Invalid certificate extracted"
+            exit 1
+          fi
+
+          echo "✅ Certificate OK"
+
+          # ✅ Export OCI WITH signatures
+          oras copy -r $LOCAL --to-oci-layout $OUT
+
+          tar -czf ${OUT}.tgz $OUT
+
+          docker rm -f reg
+
+      # ✅ Save output
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
+          mv *.tgz artifacts/
+          mv signer.crt artifacts/
+          mv inspect.json artifacts/
 
-          mv *.tgz artifacts/ || true
-          mv signer.crt artifacts/ || true
-          mv inspect.json artifacts/ || true
-
-      # ✅ Upload result
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: signed-oci-export
           path: artifacts

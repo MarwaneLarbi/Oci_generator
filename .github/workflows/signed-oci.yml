@@ -59,7 +59,9 @@ jobs:
           sleep 3
 
           # ── Pull image into local registry ────────────────────────────
-          oras copy --plain-http $REF $LOCAL
+          # Source = Docker Hub (HTTPS) → no flag needed
+          # Dest   = localhost (HTTP)   → --to-plain-http
+          oras copy $REF --to-plain-http $LOCAL
 
           # ── Generate test cert and sign ───────────────────────────────
           notation cert generate-test --default dev
@@ -113,6 +115,8 @@ jobs:
           echo "✅ Fingerprint matches — cert is the signer"
 
           # ── Export OCI layout WITH signatures ─────────────────────────
+          # Source = localhost (HTTP)   → --from-plain-http
+          # Dest   = OCI layout (disk)  → --to-oci-layout (no HTTP flag needed)
           oras copy -r --from-plain-http $LOCAL --to-oci-layout $OUT
 
           # ── Pack ──────────────────────────────────────────────────────

@@ -5,10 +5,10 @@ on:
     inputs:
       image:
         required: true
-        default: "ollama/ollama"
+        default: "alpine"
       tag:
         required: true
-        default: "latest"
+        default: "3.23.5"
 
 jobs:
   export:
@@ -17,12 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ✅ Tools
+      # ✅ Install tools
       - name: Install tools
         run: |
           set -e
-
-          docker --version
 
           sudo snap install go --classic || true
           export PATH=$PATH:/snap/bin
@@ -36,7 +34,7 @@ jobs:
           oras version
           notation version
 
-      # ✅ Variables (fix namespace)
+      # ✅ Prepare variables (fix namespace)
       - name: Prepare variables
         run: |
           set -e
@@ -44,6 +42,7 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
+          # Fix Docker Hub library images
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -56,13 +55,13 @@ jobs:
           echo "REPO=$REPO" >> $GITHUB_ENV
           echo "EXPORT_DIR=$EXPORT_DIR" >> $GITHUB_ENV
 
-      # ✅ Scripts
+      # ✅ Create scripts
       - name: Create scripts
         run: |
           set -e
           mkdir -p scripts
 
-          # signoci.sh
+          # --- signoci.sh ---
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
           ref=$1
@@ -75,17 +74,7 @@ jobs:
           notation sign $ref
           EOF
 
-          # export.sh
-          cat << 'EOF' > scripts/export.sh
-          #!/bin/sh -xe
-          ref=$1
-          out=$2
-
-          oras cp $ref --to-oci-layout $out
-          tar -czf ${out}.tgz $out
-          EOF
-
-          # process.sh
+          # --- process.sh ---
           cat << 'EOF' > scripts/process.sh
           #!/bin/sh -xe
 
@@ -98,44 +87,53 @@ jobs:
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # Pull both architectures
-          oras copy -r --platform linux/amd64 $ref --to-plain-http localhost:5001/${repo}-amd64
-          oras copy -r --platform linux/arm64 $ref --to-plain-http localhost:5001/${repo}-arm64
+          # ✅ Copy architectures and capture digests
+          AMD64_DIGEST=$(oras copy -r --platform linux/amd64 $ref \
+            --to-plain-http localhost:5001/${repo}-amd64 \
+            | grep "Digest:" | awk '{print $2}')
 
-          # Create index
+          ARM64_DIGEST=$(oras copy -r --platform linux/arm64 $ref \
+            --to-plain-http localhost:5001/${repo}-arm64 \
+            | grep "Digest:" | awk '{print $2}')
+
+          # ✅ Create multi-arch index USING DIGESTS (FIX)
           oras manifest index create \
             localhost:5001/$repo \
-            localhost:5001/${repo}-amd64 \
-            localhost:5001/${repo}-arm64
+            localhost:5001/${repo}-amd64@${AMD64_DIGEST} \
+            localhost:5001/${repo}-arm64@${ARM64_DIGEST}
 
-          # Sign
+          # ✅ Sign image
           $SCRIPT_DIR/signoci.sh localhost:5001/$repo
 
-          # Export
-          $SCRIPT_DIR/export.sh localhost:5001/$repo $out
+          # ✅ Export OCI layout
+          oras cp localhost:5001/$repo --to-oci-layout $out
+
+          tar -czf ${out}.tgz $out
 
           docker rm -f reg || true
           EOF
 
           chmod +x scripts/*.sh
 
-      # ✅ Run pipeline
-      - name: Process
+      # ✅ Run
+      - name: Process image
         run: |
           set -e
+
           ./scripts/process.sh \
             docker.io/${IMAGE}:${TAG} \
             ${REPO} \
             ${EXPORT_DIR}
 
-      # ✅ Collect
+      # ✅ Collect artifacts
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
           mv *.tgz artifacts/ || true
           cp -r ~/.config/notation artifacts/certs || true
 
-      - name: Upload
+      # ✅ Upload
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: signed-oci-export

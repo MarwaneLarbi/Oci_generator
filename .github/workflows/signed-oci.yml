@@ -20,18 +20,16 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ✅ Same philosophy as OpenXPKI (minimal system changes)
+      # ✅ Ensure required tools
       - name: Ensure required tools
         run: |
           set -e
 
           echo "User: $(whoami)"
 
-          # ✅ Docker already available
           docker --version
           docker info
 
-          # ✅ Install Go via snap ONLY if missing
           if ! command -v go >/dev/null 2>&1; then
             echo "Installing Go via snap..."
             sudo snap install go --classic
@@ -71,13 +69,10 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
-          SAFE_NAME=$(echo "$IMAGE" | tr '/:' '-')
-
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
           echo "TAG=$TAG" >> $GITHUB_ENV
-          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
 
-      # ✅ Create scripts (clean like OpenXPKI jobs)
+      # ✅ Create scripts
       - name: Create scripts
         run: |
           set -e
@@ -99,14 +94,21 @@ jobs:
           # --- export.sh ---
           cat << 'EOF' > scripts/export.sh
           #!/bin/sh -xe
+
           reference=$1
+          SAFE_NAME=$2
 
-          SAFE_NAME=$(echo "$reference" | tr '/:' '-')
+          # Fallback if not provided
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME=$(echo "$reference" | tr '/:' '-')
+          fi
 
-          oras cp --to-oci-layout $reference ${SAFE_NAME}:latest
-          tar -czf ${SAFE_NAME}.tgz ${SAFE_NAME}
+          OCI_DIR="${SAFE_NAME}"
 
-          echo "EXPORT_TGZ=${SAFE_NAME}.tgz" >> $GITHUB_ENV
+          oras cp --to-oci-layout $reference ${OCI_DIR}
+          tar -czf ${OCI_DIR}.tgz ${OCI_DIR}
+
+          echo "EXPORT_TGZ=${OCI_DIR}.tgz" >> $GITHUB_ENV
           EOF
 
           # --- process.sh ---
@@ -116,7 +118,12 @@ jobs:
           SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
           reference=$1
-          repository="${reference##*/}"
+
+          repo_with_tag="${reference##*/}"       # ollama:latest
+          repository="${repo_with_tag%%:*}"      # ollama
+          tag="${repo_with_tag##*:}"             # latest
+
+          SAFE_NAME="${repository}-${tag}"
 
           # Start local registry
           docker run -d -p 5001:5000 --name dummyregistry registry:2
@@ -136,7 +143,7 @@ jobs:
           $SCRIPT_DIR/signoci.sh localhost:5001/$repository
 
           # Export OCI layout
-          $SCRIPT_DIR/export.sh localhost:5001/$repository
+          $SCRIPT_DIR/export.sh localhost:5001/$repository "$SAFE_NAME"
 
           # Cleanup
           docker kill dummyregistry || true
@@ -166,4 +173,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: signed-oci-export
-          path: artifacts/
+          path: artifacts

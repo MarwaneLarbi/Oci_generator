@@ -47,6 +47,7 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
+          # Fix Docker Hub namespace
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -65,25 +66,22 @@ jobs:
           set -e
           mkdir -p scripts
 
-          # ✅ SIGN SCRIPT
-          # IMPORTANT: no deletion, no CA export, just sign + inspect
+          # ✅ SIGN SCRIPT (FIXED)
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
 
           ref=$1
 
-          # ✅ Generate ephemeral key (fine for 1-run use)
+          # ✅ Generate test cert (OK for single-run use)
           notation cert generate-test --default dev
 
           # ✅ Sign image
           notation sign $ref
 
-          # ✅ Extract EXACT signer cert used in signature (LEAF cert)
+          # ✅ Extract EXACT signer certificate (PEM, NO base64 decode!)
           notation inspect $ref -o json > inspect.json
 
-          cat inspect.json \
-            | jq -r '.signatures[0].certificateChain[0]' \
-            | base64 -d > signer.crt
+          jq -r '.signatures[0].certificateChain[0]' inspect.json > signer.crt
 
           echo "✅ Extracted signer certificate:"
           openssl x509 -in signer.crt -noout -subject -issuer
@@ -105,11 +103,11 @@ jobs:
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ Copy FULL image (keep multi-arch + metadata)
+          # ✅ Copy FULL image (preserves multi-arch + metadata)
           oras copy $ref \
             --to-plain-http localhost:5001/${repo}:${tag}
 
-          # ✅ Sign + extract correct certificate
+          # ✅ Sign + extract cert
           $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
 
           # ✅ Export OCI layout INCLUDING signatures
@@ -142,7 +140,7 @@ jobs:
           mv signer.crt artifacts/ || true
           mv inspect.json artifacts/ || true
 
-      # ✅ Upload outputs
+      # ✅ Upload artifact
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

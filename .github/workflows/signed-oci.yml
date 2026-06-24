@@ -1,0 +1,169 @@
+name: Export OCI to TGZ (Signed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image (e.g. pytorch/pytorch or ollama/ollama)"
+        required: true
+        default: "ollama/ollama"
+      tag:
+        description: "Image tag"
+        required: true
+        default: "latest"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ✅ Same philosophy as OpenXPKI (minimal system changes)
+      - name: Ensure required tools
+        run: |
+          set -e
+
+          echo "User: $(whoami)"
+
+          # ✅ Docker already available
+          docker --version
+          docker info
+
+          # ✅ Install Go via snap ONLY if missing
+          if ! command -v go >/dev/null 2>&1; then
+            echo "Installing Go via snap..."
+            sudo snap install go --classic
+          fi
+
+          go version
+
+      # ✅ Install ORAS
+      - name: Install ORAS
+        run: |
+          set -e
+
+          go install oras.land/oras/cmd/oras@latest
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+          oras version
+
+      # ✅ Install Notation
+      - name: Install Notation
+        run: |
+          set -e
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+
+          go install github.com/notaryproject/notation/cmd/notation@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+          notation version
+
+      # ✅ Prepare variables
+      - name: Prepare variables
+        run: |
+          set -e
+
+          IMAGE="${{ github.event.inputs.image }}"
+          TAG="${{ github.event.inputs.tag }}"
+
+          SAFE_NAME=$(echo "$IMAGE" | tr '/:' '-')
+
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+
+      # ✅ Create scripts (clean like OpenXPKI jobs)
+      - name: Create scripts
+        run: |
+          set -e
+          mkdir -p scripts
+
+          # --- signoci.sh ---
+          cat << 'EOF' > scripts/signoci.sh
+          #!/bin/sh -xe
+          reference=$1
+
+          notation key delete "dev" || true
+          rm -rf ~/.config/notation/localkeys/dev*
+          notation cert delete -t ca -s "dev" -a -y || true
+
+          notation cert generate-test --default "dev"
+          notation sign $reference
+          EOF
+
+          # --- export.sh ---
+          cat << 'EOF' > scripts/export.sh
+          #!/bin/sh -xe
+          reference=$1
+
+          SAFE_NAME=$(echo "$reference" | tr '/:' '-')
+
+          oras cp --to-oci-layout $reference ${SAFE_NAME}:latest
+          tar -czf ${SAFE_NAME}.tgz ${SAFE_NAME}
+
+          echo "EXPORT_TGZ=${SAFE_NAME}.tgz" >> $GITHUB_ENV
+          EOF
+
+          # --- process.sh ---
+          cat << 'EOF' > scripts/process.sh
+          #!/bin/sh -xe
+
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+          reference=$1
+          repository="${reference##*/}"
+
+          # Start local registry
+          docker run -d -p 5001:5000 --name dummyregistry registry:2
+          sleep 3
+
+          # Copy architectures
+          oras copy -r --platform linux/amd64 $reference --to-plain-http localhost:5001/${repository}-amd64
+          oras copy -r --platform linux/arm64 $reference --to-plain-http localhost:5001/${repository}-arm64
+
+          # Create multi-arch index
+          oras manifest index create \
+            localhost:5001/$repository \
+            localhost:5001/${repository}-amd64 \
+            localhost:5001/${repository}-arm64
+
+          # Sign image
+          $SCRIPT_DIR/signoci.sh localhost:5001/$repository
+
+          # Export OCI layout
+          $SCRIPT_DIR/export.sh localhost:5001/$repository
+
+          # Cleanup
+          docker kill dummyregistry || true
+          docker rm dummyregistry || true
+          EOF
+
+          chmod +x scripts/*.sh
+
+      # ✅ Run pipeline
+      - name: Process image
+        run: |
+          set -e
+          ./scripts/process.sh docker.io/${{ env.IMAGE }}:${{ env.TAG }}
+
+      # ✅ Collect artifacts
+      - name: Collect artifacts
+        run: |
+          set -e
+
+          mkdir -p artifacts/certs
+
+          cp -r ~/.config/notation artifacts/certs/ || true
+          mv *.tgz artifacts/ 2>/dev/null || true
+
+      # ✅ Upload artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-oci-export
+          path: artifacts/

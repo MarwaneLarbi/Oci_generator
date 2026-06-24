@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       image:
+        description: "Docker image"
         required: true
         default: "alpine"
       tag:
+        description: "Image tag"
         required: true
         default: "3.23.5"
 
@@ -34,7 +36,7 @@ jobs:
           oras version
           notation version
 
-      # ✅ Prepare variables (fix namespace)
+      # ✅ Prepare variables (fix Docker Hub namespace)
       - name: Prepare variables
         run: |
           set -e
@@ -42,7 +44,6 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
-          # Fix Docker Hub library images
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -61,7 +62,7 @@ jobs:
           set -e
           mkdir -p scripts
 
-          # --- signoci.sh ---
+          # --- SIGN SCRIPT ---
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
           ref=$1
@@ -74,7 +75,7 @@ jobs:
           notation sign $ref
           EOF
 
-          # --- process.sh ---
+          # --- PROCESS SCRIPT ---
           cat << 'EOF' > scripts/process.sh
           #!/bin/sh -xe
 
@@ -87,35 +88,36 @@ jobs:
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ Copy architectures and capture digests
+          # ✅ Push SAME repo with different tags
           AMD64_DIGEST=$(oras copy -r --platform linux/amd64 $ref \
-            --to-plain-http localhost:5001/${repo}-amd64 \
+            --to-plain-http localhost:5001/${repo}:amd64 \
             | grep "Digest:" | awk '{print $2}')
 
           ARM64_DIGEST=$(oras copy -r --platform linux/arm64 $ref \
-            --to-plain-http localhost:5001/${repo}-arm64 \
+            --to-plain-http localhost:5001/${repo}:arm64 \
             | grep "Digest:" | awk '{print $2}')
 
-          # ✅ Create multi-arch index USING DIGESTS (FIX)
+          # ✅ Create multi-arch index (same repo REQUIRED)
           oras manifest index create \
-            localhost:5001/$repo \
-            localhost:5001/${repo}-amd64@${AMD64_DIGEST} \
-            localhost:5001/${repo}-arm64@${ARM64_DIGEST}
+            localhost:5001/${repo}:latest \
+            localhost:5001/${repo}@${AMD64_DIGEST} \
+            localhost:5001/${repo}@${ARM64_DIGEST}
 
           # ✅ Sign image
-          $SCRIPT_DIR/signoci.sh localhost:5001/$repo
+          $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:latest
 
           # ✅ Export OCI layout
-          oras cp localhost:5001/$repo --to-oci-layout $out
+          oras cp localhost:5001/${repo}:latest \
+            --to-oci-layout ${out}
 
-          tar -czf ${out}.tgz $out
+          tar -czf ${out}.tgz ${out}
 
           docker rm -f reg || true
           EOF
 
           chmod +x scripts/*.sh
 
-      # ✅ Run
+      # ✅ Run pipeline
       - name: Process image
         run: |
           set -e

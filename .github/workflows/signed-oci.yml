@@ -58,29 +58,27 @@ jobs:
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ── Pull image into local registry ───────────────────────────
-          oras copy --plain-http $REF $LOCAL 2>/dev/null || \
-          oras copy            $REF $LOCAL
+          # ── Pull image into local registry ────────────────────────────
+          oras copy --plain-http $REF $LOCAL
 
-          # ── Generate test cert and sign ──────────────────────────────
+          # ── Generate test cert and sign ───────────────────────────────
           notation cert generate-test --default dev
 
-          SIGN_OUTPUT=$(notation sign --plain-http $LOCAL)
+          SIGN_OUTPUT=$(notation sign --insecure-registry $LOCAL)
           echo "$SIGN_OUTPUT"
 
-          # ── Extract digest from sign output ──────────────────────────
+          # ── Extract digest from sign output ───────────────────────────
           DIGEST=$(echo "$SIGN_OUTPUT" | grep -o 'sha256:[a-f0-9]\{64\}')
           if [ -z "$DIGEST" ]; then
             echo "❌ Failed to extract digest"
             exit 1
           fi
           echo "✅ Digest: $DIGEST"
-          echo "DIGEST=$DIGEST" >> $GITHUB_ENV
 
           DIGEST_REF="localhost:5001/${REPO}@${DIGEST}"
 
           # ── Inspect signature ─────────────────────────────────────────
-          notation inspect --plain-http "$DIGEST_REF" -o json > inspect.json
+          notation inspect --insecure-registry "$DIGEST_REF" -o json > inspect.json
           echo "=== inspect.json ==="
           cat inspect.json
 
@@ -115,7 +113,7 @@ jobs:
           echo "✅ Fingerprint matches — cert is the signer"
 
           # ── Export OCI layout WITH signatures ─────────────────────────
-          oras copy -r --plain-http $LOCAL --to-oci-layout $OUT
+          oras copy -r --from-plain-http $LOCAL --to-oci-layout $OUT
 
           # ── Pack ──────────────────────────────────────────────────────
           tar -czf "${OUT}.tgz" "$OUT"
@@ -128,10 +126,9 @@ jobs:
         run: |
           set -e
           mkdir -p artifacts
-          mv *.tgz      artifacts/
-          mv signer.crt artifacts/
+          mv *.tgz        artifacts/
+          mv signer.crt   artifacts/
           mv inspect.json artifacts/
-          # Also save full notation config (trust store + keys)
           cp -r ~/.config/notation artifacts/notation-config
 
       # ✅ Upload

@@ -1,4 +1,5 @@
 name: Export OCI to TGZ
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,41 +8,57 @@ on:
         required: true
         default: "ollama/ollama"
       tag:
-        description: "Image tag (e.g. latest or 0.30.10)"
+        description: "Image tag (e.g. latest or 3.23.5)"
         required: true
         default: "latest"
+
 jobs:
   export:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
 
-      - name: Install dependencies and ORAS
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ORAS
         run: |
-          sudo apt update
-          sudo apt install -y snapd lshw
-          sudo snap install go --classic
+          set -e
+          sudo snap install go --classic || true
           export PATH=$PATH:/snap/bin
           go install oras.land/oras/cmd/oras@v1.3.1
           sudo mv $(go env GOPATH)/bin/oras /usr/local/bin/
+          oras version
 
+      # ✅ Prepare variables (fix library namespace)
       - name: Prepare variables
         run: |
-          IMAGE=${{ github.event.inputs.image }}
-          TAG=${{ github.event.inputs.tag }}
-          SAFE_NAME=$(echo "$IMAGE" | tr '/:' '-')
-          EXPORT_DIR="${SAFE_NAME}-${TAG}"
+          set -e
+
+          IMAGE="${{ github.event.inputs.image }}"
+          TAG="${{ github.event.inputs.tag }}"
+
+          # Add library/ if missing
+          if [[ "$IMAGE" != *"/"* ]]; then
+            IMAGE="library/$IMAGE"
+          fi
+
+          REPO="${IMAGE##*/}"
+          EXPORT_DIR="${REPO}-${TAG}"
+
           echo "IMAGE=$IMAGE" >> $GITHUB_ENV
           echo "TAG=$TAG" >> $GITHUB_ENV
           echo "EXPORT_DIR=$EXPORT_DIR" >> $GITHUB_ENV
 
-      - name: Pull OCI layout
+      # ✅ Pull OCI layout
+      - name: Export OCI layout
         run: |
-          oras cp --to-oci-layout docker.io/${IMAGE}:${TAG} ${EXPORT_DIR}:${TAG}
+          set -e
 
-      - name: Create tgz
+          oras cp docker.io/${IMAGE}:${TAG} \
+            --to-oci-layout ${EXPORT_DIR}
+
+      - name: Create archive
         run: |
+          set -e
           tar -czf ${EXPORT_DIR}.tgz ${EXPORT_DIR}
 
       - name: Upload artifact

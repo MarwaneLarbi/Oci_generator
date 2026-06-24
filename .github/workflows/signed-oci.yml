@@ -47,7 +47,6 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
-          # Fix Docker Hub namespace
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -66,22 +65,46 @@ jobs:
           set -e
           mkdir -p scripts
 
-          # ✅ SIGN SCRIPT (FIXED)
+          # ✅ SIGN SCRIPT (FINAL FIX)
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
 
           ref=$1
 
-          # ✅ Generate test cert (OK for single-run use)
           notation cert generate-test --default dev
-
-          # ✅ Sign image
           notation sign $ref
 
-          # ✅ Extract EXACT signer certificate (PEM, NO base64 decode!)
+          # Export inspect
           notation inspect $ref -o json > inspect.json
 
-          jq -r '.signatures[0].certificateChain[0]' inspect.json > signer.crt
+          echo "=== DEBUG: inspect.json ==="
+          cat inspect.json
+
+          # ✅ Robust certificate extraction (handles all formats)
+          CERT=$(jq -r '
+            if .signatures and (.signatures | length > 0) then
+              if .signatures[0].certificateChain then
+                .signatures[0].certificateChain[0]
+              elif .signatures[0].certificates then
+                .signatures[0].certificates[0]
+              elif .signatures[0].x509Certificate then
+                .signatures[0].x509Certificate
+              else
+                empty
+              end
+            else
+              empty
+            end
+          ' inspect.json)
+
+          # ✅ Fail fast if missing
+          if [ -z "$CERT" ] || [ "$CERT" = "null" ]; then
+            echo "❌ ERROR: No certificate found in inspect.json"
+            exit 1
+          fi
+
+          # Save certificate
+          echo "$CERT" > signer.crt
 
           echo "✅ Extracted signer certificate:"
           openssl x509 -in signer.crt -noout -subject -issuer
@@ -99,18 +122,18 @@ jobs:
           tag="${ref##*:}"
           out="${repo}-${tag}"
 
-          # ✅ Start local registry
+          # Start local registry
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ Copy FULL image (preserves multi-arch + metadata)
+          # Copy FULL image
           oras copy $ref \
             --to-plain-http localhost:5001/${repo}:${tag}
 
-          # ✅ Sign + extract cert
+          # Sign + extract certificate
           $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
 
-          # ✅ Export OCI layout INCLUDING signatures
+          # Export OCI WITH signatures
           oras copy -r \
             localhost:5001/${repo}:${tag} \
             --to-oci-layout ${out}
@@ -140,7 +163,7 @@ jobs:
           mv signer.crt artifacts/ || true
           mv inspect.json artifacts/ || true
 
-      # ✅ Upload artifact
+      # ✅ Upload result
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

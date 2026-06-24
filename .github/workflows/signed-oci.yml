@@ -103,9 +103,17 @@ jobs:
           # ✅ ✅ CRITICAL: Extract REAL signer cert (leaf, not CA)
           notation inspect localhost:5001/${repo}:${tag} -o json > inspect.json
 
-          cat inspect.json \
-            | jq -r '.signatures[0].certificateChain[0]' \
-            | base64 -d > signer.crt
+          cert="$(jq -r '.signatures[0].certificateChain[0] // empty' inspect.json)"
+          if [ -z "$cert" ]; then
+            echo "No signer certificate found in notation inspect output"
+            exit 1
+          fi
+
+          if printf '%s' "$cert" | grep -q "BEGIN CERTIFICATE"; then
+            printf '%s\n' "$cert" > signer.crt
+          else
+            printf '%s' "$cert" | base64 -d > signer.crt
+          fi
 
           echo "✅ Extracted signer cert:"
           openssl x509 -in signer.crt -noout -subject -issuer

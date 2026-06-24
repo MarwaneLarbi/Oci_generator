@@ -36,7 +36,7 @@ jobs:
           oras version
           notation version
 
-      # ✅ Prepare variables (fix Docker Hub namespace)
+      # ✅ Prepare variables
       - name: Prepare variables
         run: |
           set -e
@@ -44,6 +44,7 @@ jobs:
           IMAGE="${{ github.event.inputs.image }}"
           TAG="${{ github.event.inputs.tag }}"
 
+          # Fix Docker Hub "library" images
           if [[ "$IMAGE" != *"/"* ]]; then
             IMAGE="library/$IMAGE"
           fi
@@ -56,13 +57,12 @@ jobs:
           echo "REPO=$REPO" >> $GITHUB_ENV
           echo "EXPORT_DIR=$EXPORT_DIR" >> $GITHUB_ENV
 
-      # ✅ Create scripts
+      # ✅ Create signing script
       - name: Create scripts
         run: |
           set -e
           mkdir -p scripts
 
-          # --- SIGN SCRIPT ---
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
           ref=$1
@@ -75,7 +75,6 @@ jobs:
           notation sign $ref
           EOF
 
-          # --- PROCESS SCRIPT ---
           cat << 'EOF' > scripts/process.sh
           #!/bin/sh -xe
 
@@ -83,31 +82,26 @@ jobs:
 
           ref=$1
           repo=$2
-          out=$3
+          tag="${ref##*:}"
+          out="${repo}-${tag}"
 
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ Push SAME repo with different tags
-          AMD64_DIGEST=$(oras copy -r --platform linux/amd64 $ref \
-            --to-plain-http localhost:5001/${repo}:amd64 \
-            | grep "Digest:" | awk '{print $2}')
+          # ✅ FULL COPY (CRITICAL FIX)
+          # This preserves ALL:
+          # - architectures
+          # - annotations
+          # - attestations
+          # - original index
+          oras copy $ref \
+            --to-plain-http localhost:5001/${repo}:${tag}
 
-          ARM64_DIGEST=$(oras copy -r --platform linux/arm64 $ref \
-            --to-plain-http localhost:5001/${repo}:arm64 \
-            | grep "Digest:" | awk '{print $2}')
+          # ✅ Sign WITHOUT modifying index
+          $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
 
-          # ✅ Create multi-arch index (same repo REQUIRED)
-          oras manifest index create \
-            localhost:5001/${repo}:latest \
-            localhost:5001/${repo}@${AMD64_DIGEST} \
-            localhost:5001/${repo}@${ARM64_DIGEST}
-
-          # ✅ Sign image
-          $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:latest
-
-          # ✅ Export OCI layout
-          oras cp localhost:5001/${repo}:latest \
+          # ✅ Export OCI layout (same as oras cp)
+          oras cp localhost:5001/${repo}:${tag} \
             --to-oci-layout ${out}
 
           tar -czf ${out}.tgz ${out}

@@ -25,7 +25,7 @@ jobs:
           set -e
 
           sudo apt update
-          sudo apt install -y jq
+          sudo apt install -y jq openssl
 
           sudo snap install go --classic || true
           export PATH=$PATH:/snap/bin
@@ -65,19 +65,31 @@ jobs:
           set -e
           mkdir -p scripts
 
-          # ✅ SIGN SCRIPT (no deletion, no regen issues)
+          # ✅ SIGN SCRIPT
+          # IMPORTANT: no deletion, no CA export, just sign + inspect
           cat << 'EOF' > scripts/signoci.sh
           #!/bin/sh -xe
 
           ref=$1
 
-          # Generate key ONLY once in this run
+          # ✅ Generate ephemeral key (fine for 1-run use)
           notation cert generate-test --default dev
 
+          # ✅ Sign image
           notation sign $ref
+
+          # ✅ Extract EXACT signer cert used in signature (LEAF cert)
+          notation inspect $ref -o json > inspect.json
+
+          cat inspect.json \
+            | jq -r '.signatures[0].certificateChain[0]' \
+            | base64 -d > signer.crt
+
+          echo "✅ Extracted signer certificate:"
+          openssl x509 -in signer.crt -noout -subject -issuer
           EOF
 
-          # ✅ PROCESS SCRIPT (FULL FIX)
+          # ✅ PROCESS SCRIPT
           cat << 'EOF' > scripts/process.sh
           #!/bin/sh -xe
 
@@ -89,36 +101,18 @@ jobs:
           tag="${ref##*:}"
           out="${repo}-${tag}"
 
-          # Start registry
+          # ✅ Start local registry
           docker run -d -p 5001:5000 --name reg registry:2
           sleep 3
 
-          # ✅ Copy full image
+          # ✅ Copy FULL image (keep multi-arch + metadata)
           oras copy $ref \
             --to-plain-http localhost:5001/${repo}:${tag}
 
-          # ✅ Sign
+          # ✅ Sign + extract correct certificate
           $SCRIPT_DIR/signoci.sh localhost:5001/${repo}:${tag}
 
-          # ✅ ✅ CRITICAL: Extract REAL signer cert (leaf, not CA)
-          notation inspect localhost:5001/${repo}:${tag} -o json > inspect.json
-
-          cert="$(jq -r '.signatures[0].certificateChain[0] // empty' inspect.json)"
-          if [ -z "$cert" ]; then
-            echo "No signer certificate found in notation inspect output"
-            exit 1
-          fi
-
-          if printf '%s' "$cert" | grep -q "BEGIN CERTIFICATE"; then
-            printf '%s\n' "$cert" > signer.crt
-          else
-            printf '%s' "$cert" | base64 -d > signer.crt
-          fi
-
-          echo "✅ Extracted signer cert:"
-          openssl x509 -in signer.crt -noout -subject -issuer
-
-          # ✅ Export OCI with signatures
+          # ✅ Export OCI layout INCLUDING signatures
           oras copy -r \
             localhost:5001/${repo}:${tag} \
             --to-oci-layout ${out}
@@ -146,9 +140,9 @@ jobs:
 
           mv *.tgz artifacts/ || true
           mv signer.crt artifacts/ || true
-          cp inspect.json artifacts/ || true
+          mv inspect.json artifacts/ || true
 
-      # ✅ Upload
+      # ✅ Upload outputs
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
